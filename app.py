@@ -72,7 +72,7 @@ def main_app():
             st.rerun()
 
     st.markdown("# Atlas Intelligence")
-    st.markdown("Extrator de dados do LinkedIn (Comentários + Likes).")
+    st.markdown("Extrator Unificado (Prioridade: Comentários).")
     st.markdown("---")
 
     if "APIFY_TOKEN" not in st.secrets:
@@ -87,11 +87,11 @@ def main_app():
     url_input = st.text_input("Link do Post", placeholder="Cole a URL do LinkedIn aqui...", label_visibility="collapsed")
     st.markdown("<br>", unsafe_allow_html=True)
     
-    if st.button("INICIAR EXTRAÇÃO"):
+    if st.button("INICIAR EXTRAÇÃO PRIORITÁRIA"):
         if not url_input:
             st.warning("⚠️ O campo de link está vazio.")
         else:
-            with st.status("Processando dados...", expanded=True) as status:
+            with st.status("Iniciando Inteligência...", expanded=True) as status:
                 try:
                     client = ApifyClient(api_token)
                     
@@ -102,9 +102,13 @@ def main_app():
                     })
                     data_c = client.dataset(run_c["defaultDatasetId"]).list_items().items
                     df_c = pd.DataFrame(data_c)
-                    cols_c = ['text', 'posted_at', 'comment_url', 'author', 'owner_name', 'owner_profile_url']
+                    
+                    # Cópia para Excel
+                    df_excel_c = df_c.copy() 
                     if not df_c.empty:
-                        df_c = df_c[[c for c in cols_c if c in df_c.columns]]
+                        cols_p = ['text', 'owner_name', 'owner_profile_url', 'posted_at', 'comment_url']
+                        if all(col in df_c.columns for col in cols_p):
+                            df_excel_c = df_c[cols_p]
 
                     # 2. LIKES
                     status.write("👍 Buscando Reações...")
@@ -124,61 +128,93 @@ def main_app():
                         })
                     df_l = pd.DataFrame(lista_l)
 
-                    # 3. EXCEL (Mantido para backup)
-                    status.write("📊 Criando Excel...")
+                    # --- FASE 3: PRIORIZAÇÃO ---
+                    status.write("🧠 Aplicando prioridade (Comentário > Like)...")
+                    
+                    leads_unicos = {}
+
+                    # A. Primeiro processa Comentários (Define a Origem Mestre)
+                    if not df_c.empty:
+                        for index, row in df_c.iterrows():
+                            url = row.get('owner_profile_url') or row.get('author', {}).get('profileUrl')
+                            nome = row.get('owner_name') or row.get('author', {}).get('name')
+                            texto = row.get('text')
+
+                            if url:
+                                leads_unicos[url] = {
+                                    "Nome": nome,
+                                    "Perfil_URL": url,
+                                    "Origem": "Comentario", # <--- AQUI É DEFINIDA A PRIORIDADE
+                                    "Conteudo": texto,
+                                    "Post_Link": url_input,
+                                    "Data_Extracao": datetime.now().isoformat()
+                                }
+
+                    # B. Depois processa Likes
+                    if not df_l.empty:
+                        for index, row in df_l.iterrows():
+                            url = row.get('Perfil URL')
+                            nome = row.get('Nome')
+                            reacao = row.get('Reação')
+
+                            if url:
+                                if url in leads_unicos:
+                                    # SE JÁ EXISTE: Não mudamos a origem!
+                                    # Apenas enriquecemos com a informação da reação
+                                    leads_unicos[url]["Reacao_Linkedin"] = reacao
+                                    # Origem continua sendo "Comentario"
+                                else:
+                                    # SE NÃO EXISTE: Cria como Like
+                                    leads_unicos[url] = {
+                                        "Nome": nome,
+                                        "Perfil_URL": url,
+                                        "Origem": "Like",
+                                        "Reacao_Linkedin": reacao,
+                                        "Conteudo": "",
+                                        "Post_Link": url_input,
+                                        "Data_Extracao": datetime.now().isoformat()
+                                    }
+
+                    # --- FASE 4: EXCEL ---
+                    status.write("📊 Criando Planilha...")
                     buffer = io.BytesIO()
                     with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                        if not df_c.empty: df_c.to_excel(writer, index=False, sheet_name='Comentarios')
-                        if not df_l.empty: df_l.to_excel(writer, index=False, sheet_name='Likes')
+                        df_unicos = pd.DataFrame(list(leads_unicos.values()))
+                        if not df_unicos.empty:
+                            df_unicos.to_excel(writer, index=False, sheet_name='Leads_Unicos')
+                        else:
+                             pd.DataFrame(['Sem leads']).to_excel(writer, sheet_name='Leads_Unicos')
 
-                    # 4. CLAY (ENVIO LINHA POR LINHA)
+                        if not df_excel_c.empty: df_excel_c.to_excel(writer, index=False, sheet_name='Raw_Comentarios')
+                        if not df_l.empty: df_l.to_excel(writer, index=False, sheet_name='Raw_Likes')
+
+                    # --- FASE 5: CLAY ---
                     if clay_url:
-                        status.write("📡 Enviando para Clay (Linha a Linha)...")
-                        
-                        total_itens = len(df_c) + len(df_l)
+                        status.write(f"📡 Enviando {len(leads_unicos)} leads únicos para Clay...")
                         progresso = st.progress(0)
                         contador = 0
+                        total = len(leads_unicos)
 
-                        # Enviar Comentários (Um por um)
-                        if not df_c.empty and 'owner_name' in df_c.columns:
-                            for index, row in df_c.iterrows():
-                                payload = {
-                                    "Origem": "Comentario",
-                                    "Nome": row.get('owner_name'),
-                                    "Perfil_URL": row.get('owner_profile_url'),
-                                    "Post_Link": url_input,
-                                    "Data_Extracao": datetime.now().isoformat()
-                                }
-                                requests.post(clay_url, json=payload)
+                        for lead in leads_unicos.values():
+                            try:
+                                requests.post(clay_url, json=lead)
                                 contador += 1
-                                progresso.progress(min(contador / total_itens, 1.0))
-
-                        # Enviar Likes (Um por um)
-                        if not df_l.empty and 'Nome' in df_l.columns:
-                            for index, row in df_l.iterrows():
-                                payload = {
-                                    "Origem": "Like",
-                                    "Nome": row.get('Nome'),
-                                    "Perfil_URL": row.get('Perfil URL'),
-                                    "Tipo_Reacao": row.get('Reação'),
-                                    "Post_Link": url_input,
-                                    "Data_Extracao": datetime.now().isoformat()
-                                }
-                                requests.post(clay_url, json=payload)
-                                contador += 1
-                                progresso.progress(min(contador / total_itens, 1.0))
+                                if total > 0: progresso.progress(min(contador / total, 1.0))
+                            except:
+                                pass
                         
-                        st.success(f"Enviados {contador} leads para o Clay!")
+                        st.success(f"Enviados {contador} leads!")
 
-                    status.update(label="Sucesso!", state="complete", expanded=False)
+                    status.update(label="Sucesso Absoluto!", state="complete", expanded=False)
                     
                     st.markdown("<br>", unsafe_allow_html=True)
-                    m1, m2 = st.columns(2)
+                    m1, m2, m3 = st.columns(3)
                     m1.metric("Comentários", len(df_c))
-                    m2.metric("Likes/Reações", len(df_l))
+                    m2.metric("Likes", len(df_l))
+                    m3.metric("Leads Finais", len(leads_unicos))
                     
                     st.markdown("<br>", unsafe_allow_html=True)
-                    st.download_button("📥 BAIXAR EXCEL", data=buffer, file_name="Atlas_Dados.xlsx", use_container_width=True)
+                    st.download_button("📥 BAIXAR DADOS", data=buffer, file_name="Atlas_Leads.xlsx", use_container_width=True)
 
                 except Exception as e:
                     st.error(f"Erro: {e}")
