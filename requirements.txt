@@ -2,4 +2,4 @@ streamlit
 apify-client
 pandas
 openpyxl
-xlswriter
+xlsxwriter
